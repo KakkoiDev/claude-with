@@ -161,6 +161,31 @@ test_only_plugins_requires_claude_on_path() {
     assert_contains "only-plugins missing-claude error message" "$out" "claude CLI not found"
 }
 
+test_only_plugins_unknown_id_hard_fails() {
+    local stub_dir="$TMPDIR_ROOT/stub-bin"
+    mkdir -p "$stub_dir"
+    cat > "$stub_dir/claude" <<'EOF'
+#!/bin/sh
+if [ "$1" = "plugin" ] && [ "$2" = "list" ]; then
+  echo '[{"id":"real-one@marketplace"},{"id":"real-two@marketplace"}]'
+  exit 0
+fi
+exit 0
+EOF
+    chmod +x "$stub_dir/claude"
+
+    rc=0
+    out=$(PATH="$stub_dir:$PATH" "$CW" --dry-run --only-plugins missing-a@m,real-one@marketplace,missing-b@m 2>&1) || rc=$?
+    assert_eq "only-plugins with unknown ids exits non-zero" "1" "$rc"
+    assert_contains "only-plugins error names first missing id" "$out" "missing-a@m"
+    assert_contains "only-plugins error names second missing id" "$out" "missing-b@m"
+    assert_not_contains "only-plugins error omits installed id" "$out" "not installed per 'claude plugin list --json': real-one"
+
+    json=$(PATH="$stub_dir:$PATH" "$CW" --dry-run --only-plugins real-one@marketplace 2>&1 | sed -n '/^# generated settings JSON:$/,/^# claude command:$/p' | sed '1d;$d')
+    assert_contains "only-plugins keeps listed installed id" "$json" '"real-one@marketplace": true'
+    assert_contains "only-plugins disables other installed id" "$json" '"real-two@marketplace": false'
+}
+
 test_settings_passthrough_merges_with_generated_keys() {
     base="$TMPDIR_ROOT/base_settings.json"
     printf '{"model": "sonnet"}\n' > "$base"
@@ -216,6 +241,7 @@ test_context_file_appends_system_prompt_and_excludes_claude_md
 test_context_dir_concatenates_into_tmpfile
 test_context_missing_path_fails
 test_only_plugins_requires_claude_on_path
+test_only_plugins_unknown_id_hard_fails
 test_settings_passthrough_merges_with_generated_keys
 test_settings_passthrough_json_string
 test_double_dash_passes_remaining_args_verbatim

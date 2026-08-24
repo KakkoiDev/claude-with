@@ -60,7 +60,7 @@ claude-with [OPTIONS] [-- CLAUDE_ARGS...]
 | --- | --- |
 | `--plugin <name>` | Enable a plugin for this session only (repeatable). `name` is the exact plugin id, e.g. `typescript-lsp@claude-plugins-official`. |
 | `--no-plugin <name>` | Disable a plugin for this session only (repeatable). |
-| `--only-plugins <a,b,c>` | Disable every other *installed* plugin, keeping only the ones listed. See [Limitations](#limitations). |
+| `--only-plugins <a,b,c>` | Disable every other *installed* plugin, keeping only the ones listed. Errors out (naming every offending id) if any listed id is not installed. See [Limitations](#limitations). |
 | `--context <file-or-dir>` | Load this file or directory instead of discovered `CLAUDE.md` files (repeatable). |
 | `--no-context` | Suppress all discovered `CLAUDE.md`/`CLAUDE.local.md`/`.claude/rules/` files. |
 | `--settings <json-or-file>` | Extra settings to merge in, same shape as `claude --settings`. claude-with's own generated keys (`enabledPlugins`, `claudeMdExcludes`) win over this base. |
@@ -109,7 +109,10 @@ claude-with --dry-run --no-plugin typescript-lsp@claude-plugins-official
   (`{"plugin-id": true|false}`) in a generated settings file passed via
   `claude --settings <file>`. `--only-plugins` first runs
   `claude plugin list --json` to enumerate every currently installed
-  plugin, then sets every id not in your list to `false`.
+  plugin, then sets every id not in your list to `false`. If any id you
+  listed is not among the installed ones (e.g. a typo), claude-with exits
+  with an error naming every missing id instead of silently disabling
+  everything.
 - **`--no-context`** and **`--context`** compute every
   `CLAUDE.md`/`CLAUDE.local.md`/`.claude/CLAUDE.md`/`.claude/rules/**`
   path that Claude Code would normally discover (every ancestor directory
@@ -130,7 +133,7 @@ claude-with --dry-run --no-plugin typescript-lsp@claude-plugins-official
   `python3`, then always written to a temp file (see "Verified behavior"
   below for why), passed as `claude --settings <file>`.
 - **`--dry-run`** just prints the generated JSON and the assembled
-  `claude` command instead of `exec`-ing it. This is also the test seam:
+  `claude` command instead of running it. This is also the test seam:
   `test_claude_with.sh` asserts against `--dry-run` output for every flag
   combination, without ever starting a real session.
 
@@ -192,7 +195,9 @@ Documented honestly rather than assumed:
   only toggle installed ones on or off for this session. If you wanted to
   provision an entirely new plugin per invocation with no prior
   `claude plugin install`, use `--plugin-dir` or `--plugin-url` directly
-  via `--` passthrough instead.
+  via `--` passthrough instead. If an id passed to `--only-plugins` is
+  not in the installed list, claude-with hard-fails with an error naming
+  every missing id rather than silently ignoring it.
 - **`--context` on a directory is not recursive and only picks up
   `*.md`/`*.txt` files, one level deep.** This is a design simplification,
   not a `claude` limitation; pass a specific file if you need something
@@ -202,7 +207,9 @@ Documented honestly rather than assumed:
   removes or renames it, `--context` breaks. There is no long-term stable
   alternative that handles arbitrary filenames the way this one does.
 - The generated `--settings` temp file is deleted when the underlying
-  `claude` process exits normally; under `--dry-run` it is deliberately
+  `claude` process exits (claude-with runs `claude` as a child process,
+  not via `exec`, precisely so its cleanup trap can fire afterwards);
+  under `--dry-run` it is deliberately
   left on disk so the printed command is actually runnable if copy-pasted
   (it will accumulate harmless files in `$TMPDIR` if you run `--dry-run`
   often; clean up `$TMPDIR/tmp.*` yourself if that bothers you).

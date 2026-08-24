@@ -123,20 +123,44 @@ if [ -n "$ONLY_PLUGINS" ]; then
   PLUGIN_LIST_JSON="$(claude plugin list --json 2>/dev/null)" || die "'claude plugin list --json' failed; cannot compute --only-plugins"
   ONLY_PLUGIN_IDS=()
   IFS=',' read -r -a ONLY_PLUGIN_IDS <<<"$ONLY_PLUGINS"
+  INSTALLED_IDS=()
   while IFS= read -r installed_id; do
     [ -z "$installed_id" ] && continue
-    keep=0
-    if [ "${#ONLY_PLUGIN_IDS[@]}" -gt 0 ]; then
-      for k in "${ONLY_PLUGIN_IDS[@]}"; do
-        [ "$k" = "$installed_id" ] && keep=1 && break
-      done
-    fi
-    if [ "$keep" = 1 ]; then
-      PLUGINS_ON+=("$installed_id")
-    else
-      PLUGINS_OFF+=("$installed_id")
-    fi
+    INSTALLED_IDS+=("$installed_id")
   done < <(printf '%s' "$PLUGIN_LIST_JSON" | python3 -c 'import json,sys; [print(p["id"]) for p in json.load(sys.stdin)]')
+
+  MISSING_IDS=()
+  if [ "${#ONLY_PLUGIN_IDS[@]}" -gt 0 ]; then
+    for k in "${ONLY_PLUGIN_IDS[@]}"; do
+      found=0
+      if [ "${#INSTALLED_IDS[@]}" -gt 0 ]; then
+        for installed_id in "${INSTALLED_IDS[@]}"; do
+          [ "$k" = "$installed_id" ] && found=1 && break
+        done
+      fi
+      [ "$found" = 1 ] || MISSING_IDS+=("$k")
+    done
+  fi
+  if [ "${#MISSING_IDS[@]}" -gt 0 ]; then
+    MISSING_LIST="$(printf '%s, ' "${MISSING_IDS[@]}")"
+    die "--only-plugins: not installed per 'claude plugin list --json': ${MISSING_LIST%, }"
+  fi
+
+  if [ "${#INSTALLED_IDS[@]}" -gt 0 ]; then
+    for installed_id in "${INSTALLED_IDS[@]}"; do
+      keep=0
+      if [ "${#ONLY_PLUGIN_IDS[@]}" -gt 0 ]; then
+        for k in "${ONLY_PLUGIN_IDS[@]}"; do
+          [ "$k" = "$installed_id" ] && keep=1 && break
+        done
+      fi
+      if [ "$keep" = 1 ]; then
+        PLUGINS_ON+=("$installed_id")
+      else
+        PLUGINS_OFF+=("$installed_id")
+      fi
+    done
+  fi
 fi
 
 # ── Build the enabledPlugins JSON fragment from PLUGINS_ON / PLUGINS_OFF. ──
@@ -203,7 +227,8 @@ PYEOF
 
 # ── Temp files created for this invocation (a --settings file, and any
 # ── concatenated --context directories). Left in place on --dry-run so
-# ── the printed command stays runnable; removed otherwise. ──
+# ── the printed command stays runnable; removed on exit otherwise
+# ── (claude runs as a child process, not exec'd, so this trap fires). ──
 TMPFILES=()
 cleanup_tmpfiles() {
   [ "$DRY_RUN" = 1 ] && return
@@ -272,4 +297,6 @@ if [ "$DRY_RUN" = 1 ]; then
   exit 0
 fi
 
-exec "${CLAUDE_CMD[@]}"
+CLAUDE_STATUS=0
+"${CLAUDE_CMD[@]}" || CLAUDE_STATUS=$?
+exit "$CLAUDE_STATUS"

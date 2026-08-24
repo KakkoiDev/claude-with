@@ -206,10 +206,11 @@ Documented honestly rather than assumed:
   the tested version. It works today; if a future Claude Code release
   removes or renames it, `--context` breaks. There is no long-term stable
   alternative that handles arbitrary filenames the way this one does.
-- The generated `--settings` temp file is deleted when the underlying
+- The temp files claude-with generates (the `--settings` file, plus one
+  concatenated file per `--context <dir>`) are deleted when the underlying
   `claude` process exits (claude-with runs `claude` as a child process,
   not via `exec`, precisely so its cleanup trap can fire afterwards);
-  under `--dry-run` it is deliberately
+  under `--dry-run` they are deliberately
   left on disk so the printed command is actually runnable if copy-pasted
   (it will accumulate harmless files in `$TMPDIR` if you run `--dry-run`
   often; clean up `$TMPDIR/tmp.*` yourself if that bothers you).

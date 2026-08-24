@@ -13,6 +13,7 @@ TESTS=()
 TMPDIR_ROOT=$(mktemp -d)
 export TMPDIR="$TMPDIR_ROOT"
 
+# shellcheck disable=SC2329  # invoked via trap EXIT
 cleanup() {
     rm -rf "$TMPDIR_ROOT"
 }

@@ -231,6 +231,7 @@ PYEOF
 # ── the printed command stays runnable; removed on exit otherwise
 # ── (claude runs as a child process, not exec'd, so this trap fires). ──
 TMPFILES=()
+# shellcheck disable=SC2329  # invoked via trap EXIT
 cleanup_tmpfiles() {
   [ "$DRY_RUN" = 1 ] && return
   if [ "${#TMPFILES[@]}" -gt 0 ]; then

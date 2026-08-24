@@ -215,9 +215,8 @@ Documented honestly rather than assumed:
   only toggle installed ones on or off for this session. If you wanted to
   provision an entirely new plugin per invocation with no prior
   `claude plugin install`, use `--plugin-dir` or `--plugin-url` directly
-  via `--` passthrough instead. If an id passed to `--only-plugins` is
-  not in the installed list, claude-with hard-fails with an error naming
-  every missing id rather than silently ignoring it.
+  via `--` passthrough instead. Unknown ids hard-fail; see "How each flag
+  is implemented".
 - **`--context` on a directory is not recursive and only picks up
   `*.md`/`*.txt` files, one level deep.** This is a design simplification,
   not a `claude` limitation; pass a specific file if you need something

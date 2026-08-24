@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+# claude-with: launch Claude Code with per-invocation plugins/settings/context.
+# No daemon, no config file, no persistent state. See README.md.
+set -euo pipefail
+
+VERSION="0.1.0"
+
+# ── Colors (disabled if not a terminal) ──────────────────────
+if [ -t 1 ]; then
+  RED='\033[0;31m'
+  YELLOW='\033[0;33m'
+  RESET='\033[0m'
+else
+  RED="" YELLOW="" RESET=""
+fi
+
+error() { printf "${RED}[x]${RESET} %s\n" "$1" >&2; }
+warn()  { printf "${YELLOW}[!]${RESET} %s\n" "$1" >&2; }
+die()   { error "$1"; exit 1; }
+
+usage() {
+  cat <<EOF
+claude-with v${VERSION}
+Launch Claude Code with exactly the plugins, settings, and context you
+choose for this invocation, without touching any persistent config.
+
+Usage: claude-with [OPTIONS] [-- CLAUDE_ARGS...]
+
+Options:
+  --plugin <name>          Enable a plugin for this session only
+                            (repeatable, exact id: name@marketplace)
+  --no-plugin <name>       Disable a plugin for this session only
+                            (repeatable)
+  --only-plugins <a,b,c>   Disable every other installed plugin, keeping
+                            only the ones listed (requires 'claude plugin
+                            list --json'; see README for limitations)
+  --context <file-or-dir>  Load this file/dir INSTEAD OF discovered
+                            CLAUDE.md files (repeatable)
+  --no-context             Suppress all discovered CLAUDE.md/rules files
+  --settings <json-or-file>  Extra settings to merge in (same shape as
+                            'claude --settings'); claude-with's own
+                            generated keys take precedence
+  --dry-run                  Print the claude command and generated
+                            settings JSON; run nothing
+  --                          Everything after this is passed to claude
+                            verbatim
+  -h, --help                 Show this help
+  -v, --version               Show version
+
+Examples:
+  claude-with --no-plugin typescript-lsp@claude-plugins-official
+  claude-with --plugin x@marketplace --context docs/onboarding.md
+  claude-with --only-plugins security-review@claude-plugins-official
+  claude-with --dry-run --no-context
+EOF
+}
+
+PLUGINS_ON=()
+PLUGINS_OFF=()
+ONLY_PLUGINS=""
+CONTEXT_PATHS=()
+NO_CONTEXT=0
+USER_SETTINGS=""
+DRY_RUN=0
+CLAUDE_ARGS=()
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --plugin)
+      [ $# -ge 2 ] || die "--plugin requires an argument"
+      PLUGINS_ON+=("$2"); shift 2 ;;
+    --no-plugin)
+      [ $# -ge 2 ] || die "--no-plugin requires an argument"
+      PLUGINS_OFF+=("$2"); shift 2 ;;
+    --only-plugins)
+      [ $# -ge 2 ] || die "--only-plugins requires an argument"
+      ONLY_PLUGINS="$2"; shift 2 ;;
+    --context)
+      [ $# -ge 2 ] || die "--context requires an argument"
+      CONTEXT_PATHS+=("$2"); shift 2 ;;
+    --no-context)
+      NO_CONTEXT=1; shift ;;
+    --settings)
+      [ $# -ge 2 ] || die "--settings requires an argument"
+      USER_SETTINGS="$2"; shift 2 ;;
+    --dry-run)
+      DRY_RUN=1; shift ;;
+    -h|--help)
+      usage; exit 0 ;;
+    -v|--version)
+      echo "claude-with v${VERSION}"; exit 0 ;;
+    --)
+      shift
+      while [ $# -gt 0 ]; do CLAUDE_ARGS+=("$1"); shift; done
+      break ;;
+    *)
+      die "Unknown option: $1 (use -- to pass claude args verbatim)" ;;
+  esac
+done
+
+command -v python3 >/dev/null 2>&1 || die "python3 is required (used to build/merge settings JSON)"
+
+# ── Resolve directories whose CLAUDE.md/CLAUDE.local.md/rules would be
+# ── auto-discovered, so --no-context / --context can exclude them all. ──
+claude_md_exclude_globs() {
+  local dir="$PWD"
+  local prefix
+  local globs=()
+  while :; do
+    if [ "$dir" = "/" ]; then prefix=""; else prefix="$dir"; fi
+    globs+=("$prefix/CLAUDE.md" "$prefix/CLAUDE.local.md" "$prefix/.claude/CLAUDE.md" "$prefix/.claude/rules/**")
+    [ "$dir" = "/" ] && break
+    dir="$(dirname "$dir")"
+  done
+  globs+=("$HOME/.claude/CLAUDE.md" "$HOME/.claude/rules/**")
+  printf '%s\n' "${globs[@]}" | sort -u
+}
+
+# ── --only-plugins: enumerate installed plugins, disable everything ──
+# ── not explicitly kept. ──
+if [ -n "$ONLY_PLUGINS" ]; then
+  command -v claude >/dev/null 2>&1 || die "claude CLI not found on PATH"
+  PLUGIN_LIST_JSON="$(claude plugin list --json 2>/dev/null)" || die "'claude plugin list --json' failed; cannot compute --only-plugins"
+  ONLY_PLUGIN_IDS=()
+  IFS=',' read -r -a ONLY_PLUGIN_IDS <<<"$ONLY_PLUGINS"
+  while IFS= read -r installed_id; do
+    [ -z "$installed_id" ] && continue
+    keep=0
+    if [ "${#ONLY_PLUGIN_IDS[@]}" -gt 0 ]; then
+      for k in "${ONLY_PLUGIN_IDS[@]}"; do
+        [ "$k" = "$installed_id" ] && keep=1 && break
+      done
+    fi
+    if [ "$keep" = 1 ]; then
+      PLUGINS_ON+=("$installed_id")
+    else
+      PLUGINS_OFF+=("$installed_id")
+    fi
+  done < <(printf '%s' "$PLUGIN_LIST_JSON" | python3 -c 'import json,sys; [print(p["id"]) for p in json.load(sys.stdin)]')
+fi
+
+# ── Build the enabledPlugins JSON fragment from PLUGINS_ON / PLUGINS_OFF. ──
+CW_ON=""
+if [ "${#PLUGINS_ON[@]}" -gt 0 ]; then
+  CW_ON="$(printf '%s\n' "${PLUGINS_ON[@]}")"
+fi
+CW_OFF=""
+if [ "${#PLUGINS_OFF[@]}" -gt 0 ]; then
+  CW_OFF="$(printf '%s\n' "${PLUGINS_OFF[@]}")"
+fi
+export CW_ON CW_OFF
+
+CW_ENABLED_PLUGINS_JSON="$(python3 <<'PYEOF'
+import json, os
+on = [l for l in os.environ.get("CW_ON", "").splitlines() if l]
+off = [l for l in os.environ.get("CW_OFF", "").splitlines() if l]
+out = {}
+for name in off:
+    out[name] = False
+for name in on:
+    out[name] = True
+print(json.dumps(out))
+PYEOF
+)"
+export CW_ENABLED_PLUGINS_JSON
+
+# ── Build the claudeMdExcludes JSON fragment. ──
+CW_CLAUDE_MD_EXCLUDES_JSON="[]"
+if [ "$NO_CONTEXT" = 1 ] || [ "${#CONTEXT_PATHS[@]}" -gt 0 ]; then
+  CW_CLAUDE_MD_EXCLUDES_JSON="$(claude_md_exclude_globs | python3 -c 'import json,sys; print(json.dumps([l.rstrip("\n") for l in sys.stdin]))')"
+fi
+export CW_CLAUDE_MD_EXCLUDES_JSON
+
+# ── Merge everything into the final --settings JSON. Our generated keys ──
+# ── (enabledPlugins, claudeMdExcludes) win over a user-supplied base. ──
+export CW_USER_SETTINGS="$USER_SETTINGS"
+SETTINGS_JSON="$(python3 <<'PYEOF'
+import json, os
+
+base_arg = os.environ.get("CW_USER_SETTINGS", "")
+data = {}
+if base_arg:
+    if os.path.isfile(base_arg):
+        with open(base_arg) as f:
+            data = json.load(f)
+    else:
+        data = json.loads(base_arg)
+
+enabled_plugins = json.loads(os.environ.get("CW_ENABLED_PLUGINS_JSON", "{}"))
+if enabled_plugins:
+    merged = dict(data.get("enabledPlugins", {}))
+    merged.update(enabled_plugins)
+    data["enabledPlugins"] = merged
+
+excludes = json.loads(os.environ.get("CW_CLAUDE_MD_EXCLUDES_JSON", "[]"))
+if excludes:
+    existing = data.get("claudeMdExcludes", [])
+    data["claudeMdExcludes"] = existing + [e for e in excludes if e not in existing]
+
+print(json.dumps(data, indent=2, sort_keys=True))
+PYEOF
+)"
+
+# ── Temp files created for this invocation (a --settings file, and any
+# ── concatenated --context directories). Left in place on --dry-run so
+# ── the printed command stays runnable; removed otherwise. ──
+TMPFILES=()
+cleanup_tmpfiles() {
+  [ "$DRY_RUN" = 1 ] && return
+  if [ "${#TMPFILES[@]}" -gt 0 ]; then
+    for f in "${TMPFILES[@]}"; do
+      rm -f "$f"
+    done
+  fi
+}
+trap cleanup_tmpfiles EXIT
+
+# claude-with writes settings to a temp FILE rather than passing the JSON
+# inline on the command line. Empirically (v2.1.241), an inline
+# `--settings '<json>'` string did not reliably apply `claudeMdExcludes`,
+# while `--settings <file>` with the identical content did. See README's
+# "Verified behavior" section.
+SETTINGS_FILE=""
+if [ -n "$SETTINGS_JSON" ] && [ "$SETTINGS_JSON" != "{}" ]; then
+  SETTINGS_FILE="$(mktemp)"
+  TMPFILES+=("$SETTINGS_FILE")
+  printf '%s\n' "$SETTINGS_JSON" > "$SETTINGS_FILE"
+fi
+
+# ── --context: append each file's content as a system-prompt addendum. ──
+# ── For a directory, concatenate its regular files (sorted, one level  ──
+# ── deep) into one temp file; only *.md and *.txt are included.        ──
+APPEND_SYSTEM_PROMPT_FILES=()
+if [ "${#CONTEXT_PATHS[@]}" -gt 0 ]; then
+  for p in "${CONTEXT_PATHS[@]}"; do
+    [ -e "$p" ] || die "--context path not found: $p"
+    if [ -d "$p" ]; then
+      tmp="$(mktemp)"
+      TMPFILES+=("$tmp")
+      : > "$tmp"
+      while IFS= read -r f; do
+        cat "$f" >> "$tmp"
+        printf '\n\n' >> "$tmp"
+      done < <(find "$p" -maxdepth 1 -type f \( -name '*.md' -o -name '*.txt' \) | sort)
+      APPEND_SYSTEM_PROMPT_FILES+=("$tmp")
+    else
+      APPEND_SYSTEM_PROMPT_FILES+=("$p")
+    fi
+  done
+fi
+
+# ── Assemble the claude invocation ──
+CLAUDE_CMD=(claude)
+if [ -n "$SETTINGS_FILE" ]; then
+  CLAUDE_CMD+=(--settings "$SETTINGS_FILE")
+fi
+if [ "${#APPEND_SYSTEM_PROMPT_FILES[@]}" -gt 0 ]; then
+  for f in "${APPEND_SYSTEM_PROMPT_FILES[@]}"; do
+    CLAUDE_CMD+=(--append-system-prompt-file "$f")
+  done
+fi
+if [ "${#CLAUDE_ARGS[@]}" -gt 0 ]; then
+  CLAUDE_CMD+=("${CLAUDE_ARGS[@]}")
+fi
+
+if [ "$DRY_RUN" = 1 ]; then
+  echo "# generated settings JSON:"
+  echo "$SETTINGS_JSON"
+  echo "# claude command:"
+  printf '%q ' "${CLAUDE_CMD[@]}"
+  echo
+  exit 0
+fi
+
+exec "${CLAUDE_CMD[@]}"

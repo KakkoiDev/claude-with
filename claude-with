@@ -8,14 +8,12 @@ VERSION="0.1.0"
 # ── Colors (disabled if not a terminal) ──────────────────────
 if [ -t 1 ]; then
   RED='\033[0;31m'
-  YELLOW='\033[0;33m'
   RESET='\033[0m'
 else
-  RED="" YELLOW="" RESET=""
+  RED="" RESET=""
 fi
 
 error() { printf "${RED}[x]${RESET} %s\n" "$1" >&2; }
-warn()  { printf "${YELLOW}[!]${RESET} %s\n" "$1" >&2; }
 die()   { error "$1"; exit 1; }
 
 usage() {
@@ -101,11 +99,14 @@ done
 command -v python3 >/dev/null 2>&1 || die "python3 is required (used to build/merge settings JSON)"
 
 # ── Resolve directories whose CLAUDE.md/CLAUDE.local.md/rules would be
-# ── auto-discovered, so --no-context / --context can exclude them all. ──
+# ── auto-discovered (ancestors of cwd at launch, subdirectories of cwd
+# ── on demand, ~/.claude), so --no-context / --context exclude them all. ──
 claude_md_exclude_globs() {
   local dir="$PWD"
   local prefix
   local globs=()
+  if [ "$dir" = "/" ]; then prefix=""; else prefix="$dir"; fi
+  globs+=("$prefix/**/CLAUDE.md" "$prefix/**/CLAUDE.local.md" "$prefix/**/.claude/CLAUDE.md" "$prefix/**/.claude/rules/**")
   while :; do
     if [ "$dir" = "/" ]; then prefix=""; else prefix="$dir"; fi
     globs+=("$prefix/CLAUDE.md" "$prefix/CLAUDE.local.md" "$prefix/.claude/CLAUDE.md" "$prefix/.claude/rules/**")
@@ -247,7 +248,7 @@ trap cleanup_tmpfiles EXIT
 # "Verified behavior" section.
 SETTINGS_FILE=""
 if [ -n "$SETTINGS_JSON" ] && [ "$SETTINGS_JSON" != "{}" ]; then
-  SETTINGS_FILE="$(mktemp)"
+  SETTINGS_FILE="$(mktemp "${TMPDIR:-/tmp}/claude-with.XXXXXX")"
   TMPFILES+=("$SETTINGS_FILE")
   printf '%s\n' "$SETTINGS_JSON" > "$SETTINGS_FILE"
 fi
@@ -260,7 +261,7 @@ if [ "${#CONTEXT_PATHS[@]}" -gt 0 ]; then
   for p in "${CONTEXT_PATHS[@]}"; do
     [ -e "$p" ] || die "--context path not found: $p"
     if [ -d "$p" ]; then
-      tmp="$(mktemp)"
+      tmp="$(mktemp "${TMPDIR:-/tmp}/claude-with.XXXXXX")"
       TMPFILES+=("$tmp")
       : > "$tmp"
       while IFS= read -r f; do

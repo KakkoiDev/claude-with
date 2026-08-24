@@ -62,7 +62,7 @@ claude-with [OPTIONS] [-- CLAUDE_ARGS...]
 | `--no-plugin <name>` | Disable a plugin for this session only (repeatable). |
 | `--only-plugins <a,b,c>` | Disable every other *installed* plugin, keeping only the ones listed. Errors out (naming every offending id) if any listed id is not installed. See [Limitations](#limitations). |
 | `--context <file-or-dir>` | Load this file or directory instead of discovered `CLAUDE.md` files (repeatable). |
-| `--no-context` | Suppress all discovered `CLAUDE.md`/`CLAUDE.local.md`/`.claude/rules/` files. |
+| `--no-context` | Suppress all discovered `CLAUDE.md`/`CLAUDE.local.md`/`.claude/CLAUDE.md`/`.claude/rules/` files: those in every ancestor directory of the cwd (loaded at launch), those in every subdirectory of the cwd (loaded on demand when Claude reads files there), and `~/.claude/`. |
 | `--settings <json-or-file>` | Extra settings to merge in, same shape as `claude --settings`. claude-with's own generated keys (`enabledPlugins`, `claudeMdExcludes`) win over this base. |
 | `--dry-run` | Print the generated settings JSON and the exact `claude` command; run nothing. |
 | `--` | Everything after this is passed to `claude` verbatim (e.g. `-p`, `--model`, a prompt). |
@@ -112,11 +112,15 @@ claude-with --dry-run --no-plugin typescript-lsp@claude-plugins-official
   plugin, then sets every id not in your list to `false`. If any id you
   listed is not among the installed ones (e.g. a typo), claude-with exits
   with an error naming every missing id instead of silently disabling
-  everything.
+  everything. Precedence: enabling always wins over disabling, regardless
+  of flag order. `--plugin x --no-plugin x` leaves `x` enabled, and
+  `--only-plugins a@m --no-plugin a@m` leaves `a@m` enabled, because the
+  disable set is applied first and the enable set on top of it.
 - **`--no-context`** and **`--context`** compute every
   `CLAUDE.md`/`CLAUDE.local.md`/`.claude/CLAUDE.md`/`.claude/rules/**`
   path that Claude Code would normally discover (every ancestor directory
-  of your cwd, plus `~/.claude/`) and puts them all in
+  of your cwd, every subdirectory of your cwd via `<cwd>/**/...` globs,
+  plus `~/.claude/`) and puts them all in
   [`claudeMdExcludes`](https://code.claude.com/docs/en/memory#exclude-specific-claude-md-files).
   `--context <path>` additionally passes that file's content (or, for a
   directory, its top-level `*.md`/`*.txt` files concatenated into one temp
@@ -145,6 +149,22 @@ mechanism below:
 
 - `claude --settings <file>` with `claudeMdExcludes` reliably suppresses
   the listed `CLAUDE.md` file. Confirmed working.
+- `**` glob entries in `claudeMdExcludes` suppress `.claude/rules/` files
+  and subdirectory `CLAUDE.md` files. Test setup: a temp cwd containing
+  `.claude/rules/secret.md` (instructing "reply QUARTZ") and
+  `sub/deep/CLAUDE.md` (instructing "reply GRANITE"); the prompt made
+  Claude read `sub/deep/notes.txt` to trigger subdirectory discovery,
+  then asked for both words. With only `~/.claude/` excluded the answer
+  was `SECRET=QUARTZ SUB=GRANITE`. With `<cwd>/.claude/rules/**`,
+  `<cwd>/**/CLAUDE.md`, `<cwd>/**/.claude/rules/**` (and the other
+  subtree globs claude-with emits) added, the answer was
+  `SECRET=UNKNOWN SUB=UNKNOWN`. Both globs were present in the same run,
+  so this shows the rules file and the nested `CLAUDE.md` were suppressed
+  by the set, not which single pattern caught the rules file.
+- A `claudeMdExcludes` entry matches the path as configured, not its
+  symlink target: excluding `~/.claude/CLAUDE.md` suppressed a
+  `~/.claude/CLAUDE.md` that is a symlink into a dotfiles repo, while
+  excluding only the resolved dotfiles path did not.
 - `claude --settings '<inline-json>'` (the JSON passed as a literal
   command-line string, not a file) did not reliably apply
   `claudeMdExcludes` in repeated tests: a `CLAUDE.md` targeted by an
@@ -213,7 +233,7 @@ Documented honestly rather than assumed:
   under `--dry-run` they are deliberately
   left on disk so the printed command is actually runnable if copy-pasted
   (it will accumulate harmless files in `$TMPDIR` if you run `--dry-run`
-  often; clean up `$TMPDIR/tmp.*` yourself if that bothers you).
+  often; they are named `$TMPDIR/claude-with.*`, so `rm $TMPDIR/claude-with.*` cleans them up).
 
 ## Testing
 

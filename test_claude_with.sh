@@ -11,6 +11,7 @@ TESTS=()
 # ============================================================
 
 TMPDIR_ROOT=$(mktemp -d)
+export TMPDIR="$TMPDIR_ROOT"
 
 cleanup() {
     rm -rf "$TMPDIR_ROOT"
@@ -122,6 +123,28 @@ test_no_context_excludes_all_discovered_claude_md() {
     assert_contains "no-context excludes user CLAUDE.md" "$json" "$HOME/.claude/CLAUDE.md"
 }
 
+test_no_context_excludes_subdirectory_claude_md() {
+    local cwd="$TMPDIR_ROOT/subtree-cwd"
+    mkdir -p "$cwd/packages/api/.claude/rules"
+    echo "nested" > "$cwd/packages/api/CLAUDE.md"
+    echo "nested rule" > "$cwd/packages/api/.claude/rules/r.md"
+
+    json=$(cd "$cwd" && "$CW" --dry-run --no-context 2>&1 | sed -n '/^# generated settings JSON:$/,/^# claude command:$/p' | sed '1d;$d')
+    assert_contains "no-context emits cwd subtree CLAUDE.md glob" "$json" "$cwd/**/CLAUDE.md"
+    assert_contains "no-context emits cwd subtree CLAUDE.local.md glob" "$json" "$cwd/**/CLAUDE.local.md"
+    assert_contains "no-context emits cwd subtree .claude/CLAUDE.md glob" "$json" "$cwd/**/.claude/CLAUDE.md"
+    assert_contains "no-context emits cwd subtree rules glob" "$json" "$cwd/**/.claude/rules/**"
+
+    matched=$(printf '%s' "$json" | CW_TARGET="$cwd/packages/api/CLAUDE.md" CW_RULE="$cwd/packages/api/.claude/rules/r.md" python3 -c '
+import json, os, sys, fnmatch
+globs = json.load(sys.stdin)["claudeMdExcludes"]
+def hit(path):
+    return any(fnmatch.fnmatchcase(path, g.replace("**", "*")) for g in globs)
+print("md" if hit(os.environ["CW_TARGET"]) else "-", "rule" if hit(os.environ["CW_RULE"]) else "-")
+')
+    assert_eq "no-context globs match nested CLAUDE.md and nested rules file" "md rule" "$matched"
+}
+
 test_context_file_appends_system_prompt_and_excludes_claude_md() {
     ctx="$TMPDIR_ROOT/ctx.md"
     echo "context body" > "$ctx"
@@ -143,6 +166,12 @@ test_context_dir_concatenates_into_tmpfile() {
     cmd=$(command_of --context "$dir")
     assert_contains "context dir passed via --append-system-prompt-file" "$cmd" "--append-system-prompt-file"
     assert_not_contains "context dir does not pass the dir path itself" "$cmd" "--append-system-prompt-file $dir "
+
+    tmpfile=$(printf '%s' "$cmd" | sed -n 's/.*--append-system-prompt-file \([^ ]*\).*/\1/p')
+    assert_eq "context dir temp file exists" "yes" "$([ -f "$tmpfile" ] && echo yes || echo no)"
+    content=$(cat "$tmpfile"; echo x)
+    assert_eq "context dir temp file is sorted md/txt content, c.bin excluded" "$(printf 'one\n\n\ntwo\n\n\n'; echo x)" "$content"
+    assert_contains "dry-run temp files land under the suite's cleanup root" "$tmpfile" "$TMPDIR_ROOT/"
 }
 
 test_context_missing_path_fails() {
@@ -150,13 +179,14 @@ test_context_missing_path_fails() {
 }
 
 test_only_plugins_requires_claude_on_path() {
-    local claude_path claude_dir stripped_path
-    claude_path=$(command -v claude) || { TESTS+=("  SKIP  only-plugins missing-claude (no claude on PATH to strip)"); return; }
-    claude_dir=$(dirname "$claude_path")
-    stripped_path=$(printf '%s' "$PATH" | tr ':' '\n' | grep -vF -- "$claude_dir" | tr '\n' ':')
+    local bin_dir="$TMPDIR_ROOT/no-claude-bin"
+    mkdir -p "$bin_dir"
+    for tool in bash python3; do
+        ln -s "$(command -v "$tool")" "$bin_dir/$tool"
+    done
 
     rc=0
-    out=$(PATH="$stripped_path" "$CW" --dry-run --only-plugins foo@bar 2>&1) || rc=$?
+    out=$(PATH="$bin_dir" "$CW" --dry-run --only-plugins foo@bar 2>&1) || rc=$?
     assert_eq "only-plugins without claude on PATH fails" "1" "$rc"
     assert_contains "only-plugins missing-claude error message" "$out" "claude CLI not found"
 }
@@ -237,6 +267,7 @@ test_no_plugin_disables_exact_plugin
 test_plugin_enables_exact_plugin
 test_plugin_and_no_plugin_repeatable
 test_no_context_excludes_all_discovered_claude_md
+test_no_context_excludes_subdirectory_claude_md
 test_context_file_appends_system_prompt_and_excludes_claude_md
 test_context_dir_concatenates_into_tmpfile
 test_context_missing_path_fails

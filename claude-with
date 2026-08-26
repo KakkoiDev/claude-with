@@ -3,18 +3,27 @@
 # No daemon, no config file, no persistent state. See README.md.
 set -euo pipefail
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 
 # ── Colors (disabled if not a terminal) ──────────────────────
 if [ -t 1 ]; then
   RED='\033[0;31m'
+  YELLOW='\033[0;33m'
   RESET='\033[0m'
 else
-  RED="" RESET=""
+  RED="" YELLOW="" RESET=""
 fi
 
 error() { printf "${RED}[x]${RESET} %s\n" "$1" >&2; }
 die()   { error "$1"; exit 1; }
+warn()  { printf "${YELLOW}[!]${RESET} %s\n" "$1" >&2; }
+
+# ── Where claude-with looks for plugin marketplaces/registry. Read-only,
+# ── never written to. Overridable so tests exercise fixture directories
+# ── instead of a developer's real ~/.claude. ──────────────────────────
+PLUGINS_HOME="${CLAUDE_WITH_PLUGINS_HOME:-$HOME/.claude/plugins}"
+REGISTRY_FILE="$PLUGINS_HOME/known_marketplaces.json"
+MARKETPLACES_DIR="$PLUGINS_HOME/marketplaces"
 
 usage() {
   cat <<EOF
@@ -23,6 +32,7 @@ Launch Claude Code with exactly the plugins, settings, and context you
 choose for this invocation, without touching any persistent config.
 
 Usage: claude-with [OPTIONS] [-- CLAUDE_ARGS...]
+       claude-with doctor
 
 Options:
   --plugin <name>          Enable a plugin for this session only
@@ -45,13 +55,220 @@ Options:
   -h, --help                 Show this help
   -v, --version               Show version
 
+Subcommands:
+  doctor                     Check this machine's Claude Code plugin setup
+                            (registry, marketplaces, claude on PATH) and
+                            print OK/WARN/FAIL for each check.
+
 Examples:
   claude-with --no-plugin typescript-lsp@claude-plugins-official
   claude-with --plugin x@marketplace --context docs/onboarding.md
   claude-with --only-plugins security-review@claude-plugins-official
   claude-with --dry-run --no-context
+  claude-with doctor
 EOF
 }
+
+# ── Plugin directory resolution ──────────────────────────────────────
+# Resolves a "name@marketplace" plugin id to a directory suitable for
+# 'claude --plugin-dir', by reading the marketplace.json that already
+# exists on disk under $MARKETPLACES_DIR/<marketplace>/ -- NOT the
+# registry's installLocation, which is what breaks when it points at a
+# stale or another-machine path. If the resolved directory has no
+# .claude-plugin/plugin.json (some marketplace entries carry the full
+# manifest inline in marketplace.json instead, e.g. LSP plugins),
+# synthesizes one in a temp directory of symlinks so --plugin-dir still
+# has a valid manifest to read.
+#
+# Prints one of:
+#   RESOLVED <dir>          on success (may be preceded by WARN lines)
+#   WARN <message>          zero or more, printed before RESOLVED/FAIL
+#   FAIL <message>          on failure, nothing else printed
+# Exit code mirrors success (0) / failure (1).
+resolve_plugin_dir() {
+  local plugin_id="$1"
+  CW_RESOLVE_PLUGIN_ID="$plugin_id" CW_RESOLVE_MARKETPLACES_DIR="$MARKETPLACES_DIR" python3 <<'PYEOF'
+import json
+import os
+import sys
+import tempfile
+
+plugin_id = os.environ["CW_RESOLVE_PLUGIN_ID"]
+marketplaces_dir = os.environ["CW_RESOLVE_MARKETPLACES_DIR"]
+
+if "@" not in plugin_id:
+    print(f"FAIL malformed plugin id (expected name@marketplace): {plugin_id}")
+    sys.exit(1)
+name, marketplace = plugin_id.split("@", 1)
+
+mkt_root = os.path.join(marketplaces_dir, marketplace)
+mkt_json_path = os.path.join(mkt_root, ".claude-plugin", "marketplace.json")
+if not os.path.isfile(mkt_json_path):
+    print(f"FAIL marketplace '{marketplace}' has no marketplace.json on disk at {mkt_json_path}")
+    sys.exit(1)
+
+try:
+    with open(mkt_json_path) as f:
+        mkt = json.load(f)
+except (OSError, json.JSONDecodeError) as e:
+    print(f"FAIL could not read/parse {mkt_json_path}: {e}")
+    sys.exit(1)
+
+entry = None
+for p in mkt.get("plugins", []):
+    if p.get("name") == name:
+        entry = p
+        break
+if entry is None:
+    print(f"FAIL plugin '{name}' not found in marketplace '{marketplace}' on disk ({mkt_json_path})")
+    sys.exit(1)
+
+source = entry.get("source")
+if isinstance(source, dict):
+    print(f"FAIL plugin '{name}' has a remote '{source.get('source', '?')}' source in marketplace.json, "
+          f"not a local path claude-with can resolve to a directory")
+    sys.exit(1)
+if not isinstance(source, str) or not source:
+    print(f"FAIL plugin '{name}' has no usable 'source' field in marketplace.json")
+    sys.exit(1)
+
+rel = source[2:] if source.startswith("./") else source
+plugin_dir = os.path.normpath(os.path.join(mkt_root, rel))
+if not os.path.isdir(plugin_dir):
+    print(f"FAIL resolved plugin directory does not exist on disk: {plugin_dir}")
+    sys.exit(1)
+
+manifest_path = os.path.join(plugin_dir, ".claude-plugin", "plugin.json")
+if os.path.isfile(manifest_path):
+    print(f"RESOLVED {plugin_dir}")
+    sys.exit(0)
+
+print(f"WARN plugin '{plugin_id}': resolved directory has no .claude-plugin/plugin.json "
+      f"({manifest_path}); synthesizing one from the marketplace.json entry")
+synth = dict(entry)
+synth.pop("source", None)
+synth.pop("category", None)
+tmp_dir = tempfile.mkdtemp(prefix="claude-with-plugin.")
+os.makedirs(os.path.join(tmp_dir, ".claude-plugin"))
+with open(os.path.join(tmp_dir, ".claude-plugin", "plugin.json"), "w") as f:
+    json.dump(synth, f, indent=2)
+for child in os.listdir(plugin_dir):
+    if child == ".claude-plugin":
+        continue
+    os.symlink(os.path.join(plugin_dir, child), os.path.join(tmp_dir, child))
+print(f"RESOLVED {tmp_dir}")
+print(f"SYNTH {tmp_dir}")
+PYEOF
+}
+
+# ── General preflight, run on every real invocation (not --help/--version/
+# ── doctor, which have their own paths). Warns; never blocks by itself. ──
+run_preflight() {
+  if ! command -v claude >/dev/null 2>&1; then
+    warn "claude CLI not found on PATH"
+  fi
+  if [ ! -f "$REGISTRY_FILE" ]; then
+    warn "plugin registry not found: $REGISTRY_FILE (marketplace installLocations cannot be checked; --plugin/--only-plugins still resolve directly from on-disk marketplace content)"
+    return
+  fi
+  CW_REGISTRY_FILE="$REGISTRY_FILE" python3 <<'PYEOF' 2>/dev/null | while IFS= read -r line; do warn "$line"; done || true
+import json
+import os
+import sys
+
+path = os.environ["CW_REGISTRY_FILE"]
+try:
+    with open(path) as f:
+        registry = json.load(f)
+except (OSError, json.JSONDecodeError) as e:
+    print(f"could not read/parse plugin registry {path}: {e}")
+    sys.exit(0)
+if not isinstance(registry, dict):
+    print(f"plugin registry {path} is not a JSON object (got {type(registry).__name__}); marketplace installLocations cannot be checked")
+    sys.exit(0)
+
+for name, entry in registry.items():
+    loc = entry.get("installLocation") if isinstance(entry, dict) else None
+    if loc and not os.path.exists(loc):
+        print(f"marketplace '{name}' installLocation does not exist: {loc} "
+              f"(stale/cross-machine registry entry; on-disk resolution is used instead for --plugin/--only-plugins)")
+PYEOF
+}
+
+# ── `claude-with doctor` ──────────────────────────────────────────────
+run_doctor() {
+  local fail_count=0
+
+  if command -v claude >/dev/null 2>&1; then
+    echo "[OK]   claude binary on PATH ($(command -v claude))"
+  else
+    echo "[FAIL] claude binary not found on PATH"
+    fail_count=$((fail_count + 1))
+  fi
+
+  if command -v python3 >/dev/null 2>&1; then
+    echo "[OK]   python3 on PATH ($(command -v python3))"
+  else
+    echo "[FAIL] python3 not found on PATH (required to build/merge settings JSON)"
+    fail_count=$((fail_count + 1))
+  fi
+
+  if [ -f "$REGISTRY_FILE" ]; then
+    echo "[OK]   plugin registry found: $REGISTRY_FILE"
+  else
+    echo "[WARN] plugin registry not found: $REGISTRY_FILE"
+  fi
+
+  if [ -d "$MARKETPLACES_DIR" ]; then
+    echo "[OK]   marketplaces directory found: $MARKETPLACES_DIR"
+  else
+    echo "[WARN] marketplaces directory not found: $MARKETPLACES_DIR"
+  fi
+
+  if [ -f "$REGISTRY_FILE" ]; then
+    CW_REGISTRY_FILE="$REGISTRY_FILE" CW_MARKETPLACES_DIR="$MARKETPLACES_DIR" python3 <<'PYEOF' || fail_count=$((fail_count + 1))
+import json
+import os
+import sys
+
+reg_path = os.environ["CW_REGISTRY_FILE"]
+marketplaces_dir = os.environ["CW_MARKETPLACES_DIR"]
+try:
+    with open(reg_path) as f:
+        registry = json.load(f)
+except (OSError, json.JSONDecodeError) as e:
+    print(f"[FAIL] could not read/parse plugin registry {reg_path}: {e}")
+    sys.exit(1)
+if not isinstance(registry, dict):
+    print(f"[FAIL] plugin registry {reg_path} is not a JSON object (got {type(registry).__name__})")
+    sys.exit(1)
+
+for name, entry in sorted(registry.items()):
+    loc = entry.get("installLocation") if isinstance(entry, dict) else None
+    on_disk = os.path.isdir(os.path.join(marketplaces_dir, name))
+    if not loc:
+        print(f"[WARN] marketplace '{name}': registry entry has no installLocation")
+    elif os.path.exists(loc):
+        print(f"[OK]   marketplace '{name}': installLocation exists ({loc})")
+    else:
+        note = " (on-disk content found at the expected marketplace path anyway)" if on_disk else " (no on-disk marketplace content found either)"
+        print(f"[WARN] marketplace '{name}': installLocation does not exist: {loc}{note}")
+PYEOF
+  fi
+
+  echo ""
+  if [ "$fail_count" -gt 0 ]; then
+    echo "doctor: $fail_count check(s) FAILED"
+    return 1
+  fi
+  echo "doctor: no FAILs (see WARNs above for anything that needs attention)"
+  return 0
+}
+
+if [ "${1:-}" = "doctor" ]; then
+  run_doctor
+  exit $?
+fi
 
 PLUGINS_ON=()
 PLUGINS_OFF=()
@@ -97,6 +314,8 @@ while [ $# -gt 0 ]; do
 done
 
 command -v python3 >/dev/null 2>&1 || die "python3 is required (used to build/merge settings JSON)"
+
+run_preflight
 
 # ── Resolve directories whose CLAUDE.md/CLAUDE.local.md/rules would be
 # ── auto-discovered (ancestors of cwd at launch, subdirectories of cwd
@@ -164,6 +383,66 @@ if [ -n "$ONLY_PLUGINS" ]; then
   fi
 fi
 
+# ── Temp files/dirs created for this invocation (a --settings file, any
+# ── concatenated --context directories, any synthesized plugin dirs).
+# ── Left in place on a successful --dry-run so the printed command stays
+# ── runnable; removed on exit otherwise (claude runs as a child process, not
+# ── exec'd, so this trap fires). ──
+TMPFILES=()
+TMPDIRS=()
+# shellcheck disable=SC2329  # invoked via trap EXIT
+cleanup_tmpfiles() {
+  local rc=$?
+  [ "$DRY_RUN" = 1 ] && [ "$rc" -eq 0 ] && return
+  if [ "${#TMPFILES[@]}" -gt 0 ]; then
+    for f in "${TMPFILES[@]}"; do
+      rm -f "$f"
+    done
+  fi
+  if [ "${#TMPDIRS[@]}" -gt 0 ]; then
+    for d in "${TMPDIRS[@]}"; do
+      rm -rf "$d"
+    done
+  fi
+}
+trap cleanup_tmpfiles EXIT
+
+# ── Resolve an on-disk --plugin-dir for every enabled plugin id (from
+# ── --plugin and from --only-plugins' keep set), so the session actually
+# ── loads the plugin's content even when the registry's installLocation
+# ── is missing, stale, or points at a non-existent (e.g. another-machine)
+# ── path. Dies with the reason if a requested plugin cannot be resolved
+# ── to any on-disk directory at all. ──
+PLUGIN_DIR_ARGS=()
+if [ "${#PLUGINS_ON[@]}" -gt 0 ]; then
+  SEEN_IDS=""
+  SEEN_DIRS=""
+  for plugin_id in "${PLUGINS_ON[@]}"; do
+    case " $SEEN_IDS " in *" $plugin_id "*) continue ;; esac
+    SEEN_IDS="$SEEN_IDS $plugin_id"
+
+    RESOLVE_OUT="$(resolve_plugin_dir "$plugin_id" || true)"
+    RESOLVED_DIR=""
+    FAIL_REASON=""
+    while IFS= read -r line; do
+      case "$line" in
+        "RESOLVED "*) RESOLVED_DIR="${line#RESOLVED }" ;;
+        "WARN "*) warn "${line#WARN }" ;;
+        "SYNTH "*) TMPDIRS+=("${line#SYNTH }") ;;
+        "FAIL "*) FAIL_REASON="${line#FAIL }" ;;
+      esac
+    done <<<"$RESOLVE_OUT"
+
+    if [ -z "$RESOLVED_DIR" ]; then
+      die "cannot resolve plugin '$plugin_id' to any on-disk directory: ${FAIL_REASON:-unknown error}"
+    fi
+    case " $SEEN_DIRS " in
+      *" $RESOLVED_DIR "*) ;;
+      *) SEEN_DIRS="$SEEN_DIRS $RESOLVED_DIR"; PLUGIN_DIR_ARGS+=("$RESOLVED_DIR") ;;
+    esac
+  done
+fi
+
 # ── Build the enabledPlugins JSON fragment from PLUGINS_ON / PLUGINS_OFF. ──
 CW_ON=""
 if [ "${#PLUGINS_ON[@]}" -gt 0 ]; then
@@ -226,22 +505,6 @@ print(json.dumps(data, indent=2, sort_keys=True))
 PYEOF
 )"
 
-# ── Temp files created for this invocation (a --settings file, and any
-# ── concatenated --context directories). Left in place on --dry-run so
-# ── the printed command stays runnable; removed on exit otherwise
-# ── (claude runs as a child process, not exec'd, so this trap fires). ──
-TMPFILES=()
-# shellcheck disable=SC2329  # invoked via trap EXIT
-cleanup_tmpfiles() {
-  [ "$DRY_RUN" = 1 ] && return
-  if [ "${#TMPFILES[@]}" -gt 0 ]; then
-    for f in "${TMPFILES[@]}"; do
-      rm -f "$f"
-    done
-  fi
-}
-trap cleanup_tmpfiles EXIT
-
 # claude-with writes settings to a temp FILE rather than passing the JSON
 # inline on the command line. Empirically (v2.1.241), an inline
 # `--settings '<json>'` string did not reliably apply `claudeMdExcludes`,
@@ -280,6 +543,11 @@ fi
 CLAUDE_CMD=(claude)
 if [ -n "$SETTINGS_FILE" ]; then
   CLAUDE_CMD+=(--settings "$SETTINGS_FILE")
+fi
+if [ "${#PLUGIN_DIR_ARGS[@]}" -gt 0 ]; then
+  for d in "${PLUGIN_DIR_ARGS[@]}"; do
+    CLAUDE_CMD+=(--plugin-dir "$d")
+  done
 fi
 if [ "${#APPEND_SYSTEM_PROMPT_FILES[@]}" -gt 0 ]; then
   for f in "${APPEND_SYSTEM_PROMPT_FILES[@]}"; do

@@ -248,8 +248,21 @@ test_preflight_non_object_registry_warns_and_continues() {
 
     rc=0
     out=$(CLAUDE_WITH_PLUGINS_HOME="$home" "$CW" doctor 2>&1) || rc=$?
-    assert_eq "doctor still reaches its summary on a non-object registry" "0" "$rc"
+    assert_eq "doctor exits non-zero on a non-object registry" "1" "$rc"
     assert_contains "doctor reports the non-object registry" "$out" "[FAIL] plugin registry $home/known_marketplaces.json is not a JSON object"
+    assert_contains "doctor counts the registry FAIL in its summary" "$out" "doctor: 1 check(s) FAILED"
+}
+
+test_doctor_malformed_registry_json_fails() {
+    local home="$TMPDIR_ROOT/fixture-doctor-malformed-registry"
+    mkdir -p "$home"
+    echo '{not json' > "$home/known_marketplaces.json"
+
+    rc=0
+    out=$(CLAUDE_WITH_PLUGINS_HOME="$home" "$CW" doctor 2>&1) || rc=$?
+    assert_eq "doctor exits non-zero on unparseable registry" "1" "$rc"
+    assert_contains "doctor reports the unparseable registry" "$out" "[FAIL] could not read/parse plugin registry"
+    assert_contains "doctor counts the parse FAIL in its summary" "$out" "doctor: 1 check(s) FAILED"
 }
 
 test_synth_dir_removed_when_later_plugin_fails() {
@@ -264,6 +277,14 @@ test_synth_dir_removed_when_later_plugin_fails() {
     assert_contains "first plugin was synthesized before the failure" "$out" "synthesizing one"
     leftover=$(find "$tmp" -mindepth 1 -maxdepth 1 -name 'claude-with-plugin.*' | wc -l | tr -d ' ')
     assert_eq "synthesized plugin dir is removed when a later plugin fails" "0" "$leftover"
+
+    local dry_tmp="$TMPDIR_ROOT/synth-cleanup-dry-tmp"
+    mkdir -p "$dry_tmp"
+    rc=0
+    TMPDIR="$dry_tmp" CLAUDE_WITH_PLUGINS_HOME="$home" "$CW" --dry-run --plugin inline-plugin@goodmarket --plugin remote-plugin@goodmarket >/dev/null 2>&1 || rc=$?
+    assert_eq "dry-run with a later unresolvable plugin exits non-zero" "1" "$rc"
+    leftover=$(find "$dry_tmp" -mindepth 1 -maxdepth 1 -name 'claude-with-plugin.*' | wc -l | tr -d ' ')
+    assert_eq "failed dry-run leaves no synthesized plugin dir" "0" "$leftover"
 }
 
 test_no_context_excludes_all_discovered_claude_md() {
@@ -508,6 +529,7 @@ test_acceptance_no_plugin_lsp
 test_acceptance_no_context
 test_doctor_missing_registry_and_marketplaces_warns
 test_doctor_reports_good_and_stale_installlocations
+test_doctor_malformed_registry_json_fails
 test_doctor_fails_when_claude_missing_from_path
 
 echo ""

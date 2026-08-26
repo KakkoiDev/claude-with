@@ -208,7 +208,8 @@ doctor: no FAILs (see WARNs above for anything that needs attention)
 ```
 
 Exit code is `1` if any check is `[FAIL]` (currently: `claude` or
-`python3` missing from `PATH`), `0` otherwise -- `[WARN]` never affects
+`python3` missing from `PATH`, or a registry file that exists but is not
+a parseable JSON object), `0` otherwise -- `[WARN]` never affects
 the exit code, since a stale `installLocation` doesn't stop `--plugin`
 from working (claude-with resolves plugins from the on-disk marketplace
 content, not the registry). Doctor never writes anything under

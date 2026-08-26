@@ -226,7 +226,7 @@ run_doctor() {
   fi
 
   if [ -f "$REGISTRY_FILE" ]; then
-    CW_REGISTRY_FILE="$REGISTRY_FILE" CW_MARKETPLACES_DIR="$MARKETPLACES_DIR" python3 <<'PYEOF'
+    CW_REGISTRY_FILE="$REGISTRY_FILE" CW_MARKETPLACES_DIR="$MARKETPLACES_DIR" python3 <<'PYEOF' || fail_count=$((fail_count + 1))
 import json
 import os
 import sys
@@ -238,10 +238,10 @@ try:
         registry = json.load(f)
 except (OSError, json.JSONDecodeError) as e:
     print(f"[FAIL] could not read/parse plugin registry {reg_path}: {e}")
-    sys.exit(0)
+    sys.exit(1)
 if not isinstance(registry, dict):
     print(f"[FAIL] plugin registry {reg_path} is not a JSON object (got {type(registry).__name__})")
-    sys.exit(0)
+    sys.exit(1)
 
 for name, entry in sorted(registry.items()):
     loc = entry.get("installLocation") if isinstance(entry, dict) else None
@@ -385,14 +385,15 @@ fi
 
 # ── Temp files/dirs created for this invocation (a --settings file, any
 # ── concatenated --context directories, any synthesized plugin dirs).
-# ── Left in place on --dry-run so the printed command stays runnable;
-# ── removed on exit otherwise (claude runs as a child process, not
+# ── Left in place on a successful --dry-run so the printed command stays
+# ── runnable; removed on exit otherwise (claude runs as a child process, not
 # ── exec'd, so this trap fires). ──
 TMPFILES=()
 TMPDIRS=()
 # shellcheck disable=SC2329  # invoked via trap EXIT
 cleanup_tmpfiles() {
-  [ "$DRY_RUN" = 1 ] && return
+  local rc=$?
+  [ "$DRY_RUN" = 1 ] && [ "$rc" -eq 0 ] && return
   if [ "${#TMPFILES[@]}" -gt 0 ]; then
     for f in "${TMPFILES[@]}"; do
       rm -f "$f"

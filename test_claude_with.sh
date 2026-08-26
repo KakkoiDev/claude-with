@@ -235,6 +235,37 @@ test_preflight_warns_stale_installlocation_on_every_invocation() {
     assert_contains "preflight warns about stale installLocation with no plugin flags" "$out" "marketplace 'staleloc' installLocation does not exist"
 }
 
+test_preflight_non_object_registry_warns_and_continues() {
+    local home="$TMPDIR_ROOT/fixture-preflight-array-registry"
+    mkdir -p "$home"
+    echo '[]' > "$home/known_marketplaces.json"
+
+    rc=0
+    out=$(CLAUDE_WITH_PLUGINS_HOME="$home" "$CW" --dry-run 2>&1) || rc=$?
+    assert_eq "non-object registry does not abort the invocation" "0" "$rc"
+    assert_contains "non-object registry produces a warning" "$out" "is not a JSON object"
+    assert_contains "non-object registry still reaches the claude command" "$out" "claude"
+
+    rc=0
+    out=$(CLAUDE_WITH_PLUGINS_HOME="$home" "$CW" doctor 2>&1) || rc=$?
+    assert_eq "doctor still reaches its summary on a non-object registry" "0" "$rc"
+    assert_contains "doctor reports the non-object registry" "$out" "[FAIL] plugin registry $home/known_marketplaces.json is not a JSON object"
+}
+
+test_synth_dir_removed_when_later_plugin_fails() {
+    local home="$TMPDIR_ROOT/fixture-synth-cleanup"
+    make_plugin_fixture "$home"
+    local tmp="$TMPDIR_ROOT/synth-cleanup-tmp"
+    mkdir -p "$tmp"
+
+    rc=0
+    out=$(TMPDIR="$tmp" CLAUDE_WITH_PLUGINS_HOME="$home" "$CW" --plugin inline-plugin@goodmarket --plugin remote-plugin@goodmarket 2>&1) || rc=$?
+    assert_eq "second unresolvable plugin exits non-zero" "1" "$rc"
+    assert_contains "first plugin was synthesized before the failure" "$out" "synthesizing one"
+    leftover=$(find "$tmp" -mindepth 1 -maxdepth 1 -name 'claude-with-plugin.*' | wc -l | tr -d ' ')
+    assert_eq "synthesized plugin dir is removed when a later plugin fails" "0" "$leftover"
+}
+
 test_no_context_excludes_all_discovered_claude_md() {
     json=$(settings_json_of --no-context)
     assert_contains "no-context sets claudeMdExcludes" "$json" '"claudeMdExcludes"'
@@ -458,6 +489,8 @@ test_plugin_unresolvable_name_exits_nonzero
 test_plugin_remote_source_unresolvable_exits_nonzero
 test_no_plugin_does_not_require_resolution
 test_preflight_warns_stale_installlocation_on_every_invocation
+test_preflight_non_object_registry_warns_and_continues
+test_synth_dir_removed_when_later_plugin_fails
 test_no_context_excludes_all_discovered_claude_md
 test_no_context_excludes_subdirectory_claude_md
 test_context_file_appends_system_prompt_and_excludes_claude_md

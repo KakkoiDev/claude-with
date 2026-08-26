@@ -69,6 +69,9 @@ claude-with [OPTIONS] [-- CLAUDE_ARGS...]
 | `-h`, `--help` | Show help. |
 | `-v`, `--version` | Show version. |
 
+`claude-with doctor` checks this machine's plugin setup instead of
+launching anything; see [Doctor](#doctor) below.
+
 ### Examples
 
 Turn the TypeScript LSP plugin off for one session:
@@ -116,6 +119,41 @@ claude-with --dry-run --no-plugin typescript-lsp@claude-plugins-official
   of flag order. `--plugin x --no-plugin x` leaves `x` enabled, and
   `--only-plugins a@m --no-plugin a@m` leaves `a@m` enabled, because the
   disable set is applied first and the enable set on top of it.
+
+  For every plugin id that ends up *enabled* (from `--plugin` or from
+  `--only-plugins`' keep set), claude-with additionally resolves that
+  plugin to an on-disk directory and passes it to `claude` as
+  `--plugin-dir <dir>`, alongside the `enabledPlugins` entry. This is
+  what makes `--plugin` actually load the plugin's content even when
+  `~/.claude/plugins/known_marketplaces.json`'s `installLocation` for its
+  marketplace is missing, stale, or points at a path from another machine
+  (a real, observed failure mode: `installLocation` recorded a Linux path
+  after a dotfiles-portability change, Claude Code logged
+  `Marketplace <name> failed to load: cache-miss`, and the plugin loaded
+  0 language servers even though the marketplace's actual content sat at
+  the correct path on disk). Resolution ignores the registry entirely and
+  instead reads the marketplace's own
+  `~/.claude/plugins/marketplaces/<marketplace>/.claude-plugin/marketplace.json`
+  directly, finds the named plugin's `source` field, and resolves it
+  relative to the marketplace root:
+  - If the resolved directory already has its own
+    `.claude-plugin/plugin.json`, that directory is passed to
+    `--plugin-dir` as-is.
+  - If it doesn't -- some marketplace entries (LSP plugins in particular)
+    carry their whole manifest inline in `marketplace.json` instead of a
+    separate `plugin.json` file -- claude-with warns on stderr and
+    synthesizes one: a temp directory of symlinks to the plugin's files,
+    plus a `.claude-plugin/plugin.json` written from that marketplace
+    entry (minus the marketplace-only `source`/`category` fields). The
+    temp directory is removed when the `claude` process exits (left in
+    place under `--dry-run`, same as claude-with's other temp files).
+  - If the plugin's `source` is a remote reference (e.g. `git-subdir`)
+    rather than a local path, or the plugin/marketplace isn't found on
+    disk at all, resolution fails and claude-with exits non-zero naming
+    the reason -- see [Doctor](#doctor) and
+    [Limitations](#limitations).
+  - `--no-plugin` never needs resolution, since disabling a plugin
+    doesn't require loading its content.
 - **`--no-context`** and **`--context`** compute every
   `CLAUDE.md`/`CLAUDE.local.md`/`.claude/CLAUDE.md`/`.claude/rules/**`
   path that Claude Code would normally discover (every ancestor directory
@@ -140,6 +178,46 @@ claude-with --dry-run --no-plugin typescript-lsp@claude-plugins-official
   `claude` command instead of running it. This is also the test seam:
   `test_claude_with.sh` asserts against `--dry-run` output for every flag
   combination, without ever starting a real session.
+
+## Doctor
+
+Every invocation runs a lightweight preflight and prints warnings to
+stderr (never blocking the launch, except when a requested `--plugin` or
+`--only-plugins` id can't be resolved to any on-disk directory at all --
+see above) for:
+
+- the plugin registry (`~/.claude/plugins/known_marketplaces.json`)
+  being missing;
+- any marketplace in that registry whose `installLocation` doesn't exist
+  on disk;
+- the `claude` binary not being on `PATH`.
+
+`claude-with doctor` runs the same checks standalone and prints every one
+of them as `[OK]`/`[WARN]`/`[FAIL]`, without launching anything:
+
+```
+$ claude-with doctor
+[OK]   claude binary on PATH (/usr/local/bin/claude)
+[OK]   python3 on PATH (/usr/bin/python3)
+[OK]   plugin registry found: /Users/you/.claude/plugins/known_marketplaces.json
+[OK]   marketplaces directory found: /Users/you/.claude/plugins/marketplaces
+[OK]   marketplace 'claude-plugins-official': installLocation exists (...)
+[WARN] marketplace 'trailofbits': installLocation does not exist: /home/other-user/.claude/plugins/marketplaces/trailofbits (on-disk content found at the expected marketplace path anyway)
+
+doctor: no FAILs (see WARNs above for anything that needs attention)
+```
+
+Exit code is `1` if any check is `[FAIL]` (currently: `claude` or
+`python3` missing from `PATH`), `0` otherwise -- `[WARN]` never affects
+the exit code, since a stale `installLocation` doesn't stop `--plugin`
+from working (claude-with resolves plugins from the on-disk marketplace
+content, not the registry). Doctor never writes anything under
+`~/.claude`; every check is read-only.
+
+Point doctor (and every other command) at a different plugins directory
+with `CLAUDE_WITH_PLUGINS_HOME` (defaults to `~/.claude/plugins`) -- this
+is what the test suite uses to exercise fixture marketplaces instead of
+a developer's real `~/.claude`.
 
 ## Verified behavior
 
@@ -185,20 +263,37 @@ mechanism below:
 - `--dry-run` is not a real `claude` flag (`claude` itself errors with
   `unknown option '--dry-run'`), so claude-with can safely intercept it
   without ever forwarding it.
+- **`--plugin`'s `--plugin-dir` fallback fixes a real, observed failure.**
+  On a machine where `known_marketplaces.json` recorded
+  `installLocation` as a path from a different machine (so Claude Code
+  logged `Marketplace claude-plugins-official failed to load: cache-miss`
+  and loaded 0 language servers for `typescript-lsp`), plain
+  `claude -p ... --settings '{"enabledPlugins":{"typescript-lsp@...":true}}'`
+  still showed `Total LSP servers loaded: 0` in its `--debug-file` log.
+  `claude-with --plugin typescript-lsp@claude-plugins-official` on the
+  same machine resolved the plugin from the on-disk marketplace, warned
+  that it had to synthesize a `plugin.json` (this plugin's manifest lives
+  only in `marketplace.json`), passed the synthesized directory via
+  `--plugin-dir`, and the resulting session's debug log showed
+  `Loaded inline plugin from path: typescript-lsp` and
+  `Total LSP servers loaded: 1` -- the stale-registry `cache-miss` error
+  was still logged (harmless) but no longer prevented the plugin from
+  loading.
 
 ## Limitations
 
 Documented honestly rather than assumed:
 
-- **`enabledPlugins`'s runtime effect was not independently confirmed
-  end to end.** We confirmed the JSON is generated correctly and applies
-  without error via a settings file, matching the documented schema. We
-  could not confirm in this environment that a plugin actually disappears
-  from the session's available skills or tools when set to `false`,
-  because every plugin installed in the test environment was either
-  already disabled or already failing to load from its marketplace (a
-  `cache-miss` unrelated to claude-with). Verify with `claude plugin list`
-  or `/context` in your own environment if this matters to you.
+- **`--plugin`/`--only-plugins` resolution only handles a plugin whose
+  marketplace.json `source` is a local path** (`"./plugins/foo"`,
+  resolved relative to the marketplace root). A plugin whose `source` is
+  a remote reference (e.g. `{"source": "git-subdir", ...}`) cannot be
+  resolved to a directory this way; claude-with exits non-zero naming the
+  plugin and its source type rather than silently falling back to
+  `enabledPlugins`-only (which is exactly the mechanism that was already
+  proven unreliable). If you hit this, use `--plugin-dir`/`--plugin-url`
+  directly via `--` passthrough once you've fetched the plugin some other
+  way.
 - **`--no-context` / `--context` do not suppress auto memory.** Auto
   memory (`~/.claude/projects/<project>/memory/MEMORY.md`) is a separate
   system from `CLAUDE.md` and is not covered by `claudeMdExcludes`. If

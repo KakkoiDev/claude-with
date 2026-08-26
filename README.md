@@ -146,7 +146,8 @@ claude-with --dry-run --no-plugin typescript-lsp@claude-plugins-official
     plus a `.claude-plugin/plugin.json` written from that marketplace
     entry (minus the marketplace-only `source`/`category` fields). The
     temp directory is removed when the `claude` process exits (left in
-    place under `--dry-run`, same as claude-with's other temp files).
+    place only after a successful `--dry-run`, same as claude-with's
+    other temp files).
   - If the plugin's `source` is a remote reference (e.g. `git-subdir`)
     rather than a local path, or the plugin/marketplace isn't found on
     disk at all, resolution fails and claude-with exits non-zero naming
